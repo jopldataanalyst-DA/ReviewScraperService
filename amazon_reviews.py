@@ -59,6 +59,44 @@ class ScrapedReview:
 BASE_URL = "https://www.amazon.in"
 MAX_REVIEW_PAGES = 10  # Amazon caps the review listing at 10 pages anyway
 
+_xvfb_proc = None
+_xvfb_lock = None
+
+
+def start_xvfb() -> None:
+    """Start a virtual framebuffer once per process and point DISPLAY at it.
+
+    We never use Chrome's real headless mode (see _launch_chrome) because
+    uc always forces "--headless=new", which crashes on first navigation in
+    this container. Running Chrome non-headless against an Xvfb virtual
+    display avoids that code path entirely while still requiring no real
+    display/GPU. Idempotent and thread-safe - every worker thread calls this
+    before launching a driver."""
+    global _xvfb_proc, _xvfb_lock
+    import shutil
+    import subprocess
+    import threading
+
+    if os.environ.get("DISPLAY"):
+        return
+    if _xvfb_lock is None:
+        _xvfb_lock = threading.Lock()
+    with _xvfb_lock:
+        if os.environ.get("DISPLAY"):
+            return
+        xvfb_path = shutil.which("Xvfb")
+        if not xvfb_path:
+            log.warning("Xvfb not found on PATH - falling back to no virtual display")
+            return
+        _xvfb_proc = subprocess.Popen(
+            [xvfb_path, ":99", "-screen", "0", "1440x900x24", "-nolisten", "tcp"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = ":99"
+        time.sleep(1)
+        log.info("Xvfb virtual display started on :99")
+
 
 def _clean(text: Optional[str]) -> str:
     if not text:
@@ -203,13 +241,29 @@ def _launch_chrome(driver_path: str, binary_path: str | None, headless: bool, us
     opts.add_argument("--safebrowsing-disable-auto-update")
     opts.add_argument("--disable-setuid-sandbox")
 
+    # We deliberately never pass headless=True to uc.Chrome(): uc's Chrome()
+    # unconditionally strips any "--headless*" argument we add ourselves
+    # (see its arg-scan loop removing "--headless" substrings) and always
+    # re-appends "--headless=new" for Chrome >= 108 when it thinks headless
+    # mode is wanted - there is no supported way to force the older, more
+    # container-friendly headless mode through uc. "--headless=new" spins up
+    # an extra renderer/GPU pipeline that crashes immediately in this
+    # container ("disconnected: unable to send message to renderer" on the
+    # very first navigation - confirmed by direct reproduction on the
+    # deployed VPS with a fresh container, zero zombies, and a raised fd
+    # ulimit, ruling out resource exhaustion as the cause). Instead we start
+    # a virtual framebuffer (Xvfb, see start_xvfb()) once at process startup
+    # and run Chrome in its normal non-headless rendering path against that
+    # virtual display, which does not hit this bug.
+    start_xvfb()
+
     # undetected_chromedriver's own patching (stripped cdc_ variables, spoofed
     # driver signature) is what actually evades Amazon's automation checks -
     # plain Selenium's excludeSwitches/useAutomationExtension flags alone are
     # not enough anymore. uc handles the navigator.webdriver override itself.
     driver = uc.Chrome(
         options=opts,
-        headless=headless,
+        headless=False,
         driver_executable_path=driver_path,
         browser_executable_path=binary_path or None,
         user_data_dir=user_data_dir,
