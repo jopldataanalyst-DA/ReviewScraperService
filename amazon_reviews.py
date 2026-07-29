@@ -180,6 +180,28 @@ def _launch_chrome(driver_path: str, binary_path: str | None, headless: bool, us
     opts.add_argument("--lang=en-IN")
     opts.add_argument("--accept-lang=en-IN,en;q=0.9")
 
+    # Container/headless stability flags - the VPS's nix-provided Chromium has
+    # no real GPU/drivers, and letting Chrome attempt GPU compositing for
+    # actual page rendering (not just process startup, which succeeds fine
+    # even without these) is a common cause of the renderer disconnecting
+    # entirely mid-navigation (confirmed by direct reproduction on the
+    # deployed Linux server: "disconnected: unable to send message to
+    # renderer" on every single driver.get() call, 100% of the time, even
+    # at low concurrency - Chrome itself launches fine, only real page loads
+    # crash it). These trade off unnecessary subsystems Chrome doesn't need
+    # for a scraping workload for stability in a constrained container.
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-default-apps")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-sync")
+    opts.add_argument("--disable-translate")
+    opts.add_argument("--metrics-recording-only")
+    opts.add_argument("--mute-audio")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--safebrowsing-disable-auto-update")
+
     # undetected_chromedriver's own patching (stripped cdc_ variables, spoofed
     # driver signature) is what actually evades Amazon's automation checks -
     # plain Selenium's excludeSwitches/useAutomationExtension flags alone are
