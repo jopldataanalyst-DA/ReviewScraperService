@@ -82,9 +82,10 @@ def _detect_chrome_binary() -> tuple[str | None, str]:
 
 
 def _make_driver(headless: bool = True):
+    import shutil
+
     from selenium import webdriver
     from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
 
     binary_path, chrome_type = _detect_chrome_binary()
 
@@ -103,7 +104,19 @@ def _make_driver(headless: bool = True):
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
 
-    service = Service(ChromeDriverManager(chrome_type=chrome_type).install())
+    # On the VPS (Nixpacks), nix's "chromium" package already bundles a matching
+    # chromedriver in the Nix store, built against that environment's dynamic
+    # linker. A driver downloaded by webdriver_manager is a generic Linux binary
+    # that fails to exec there (WebDriverException: status code 127) - so prefer
+    # the nix-provided binary and only fall back to webdriver_manager (e.g. on a
+    # dev machine with real Google Chrome) when nothing is found on PATH.
+    driver_path = shutil.which("chromedriver")
+    if not driver_path:
+        from webdriver_manager.chrome import ChromeDriverManager
+
+        driver_path = ChromeDriverManager(chrome_type=chrome_type).install()
+
+    service = Service(driver_path)
     driver = webdriver.Chrome(service=service, options=opts)
     driver.set_page_load_timeout(30)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
