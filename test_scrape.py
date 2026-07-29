@@ -33,15 +33,16 @@ def main():
     product_id = result["asin"] or asin
     inserted = insert_new_reviews(
         "TestCompany", "TEST-MASTER-SKU", "TEST-STYLE", "TestCategory",
-        product_id, result["reviews"],
+        product_id, result["reviews"], result["rating_summary"],
     )
-    print(f"Inserted {inserted} new review row(s).")
+    print(f"Inserted {inserted} new review row(s) (rating summary included on each row).")
 
-    insert_rating_snapshot(
-        "TestCompany", "TEST-MASTER-SKU", "TEST-STYLE", "TestCategory",
-        product_id, result["rating_summary"],
-    )
-    print("Inserted rating snapshot row.")
+    if not result["reviews"]:
+        insert_rating_snapshot(
+            "TestCompany", "TEST-MASTER-SKU", "TEST-STYLE", "TestCategory",
+            product_id, result["rating_summary"],
+        )
+        print("No reviews found - inserted a standalone rating snapshot row instead.")
 
 
 if __name__ == "__main__":

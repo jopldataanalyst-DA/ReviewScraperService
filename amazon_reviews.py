@@ -14,6 +14,7 @@ Use case:
 """
 
 import logging
+import os
 import random
 import re
 import time
@@ -81,46 +82,117 @@ def _detect_chrome_binary() -> tuple[str | None, str]:
     return None, ChromeType.GOOGLE
 
 
-def _make_driver(headless: bool = True):
-    import shutil
+def _resolve_driver_path(chrome_type, unique_key: str) -> str | None:
+    """Find a chromedriver binary and hand undetected_chromedriver a writable
+    copy of it to patch in-place.
 
-    from selenium import webdriver
-    from selenium.webdriver.chrome.service import Service
+    On the VPS (Nixpacks), nix's "chromium" package already bundles a
+    matching chromedriver in the Nix store, built against that environment's
+    dynamic linker - a driver downloaded by webdriver_manager there is a
+    generic Linux binary that fails to exec (WebDriverException: status code
+    127). Either way, undetected_chromedriver patches whatever binary it's
+    given in-place, and neither the read-only Nix store nor (on Windows,
+    confirmed by direct reproduction) webdriver_manager's own cache
+    directory reliably allow that - so always work off a fresh writable
+    temp copy rather than the original path.
+
+    unique_key must be distinct per concurrent worker (e.g. derived from its
+    user_data_dir) - confirmed by direct reproduction that concurrent
+    workers sharing one hardcoded copy path collide with "WinError 32: The
+    process cannot access the file because it is being used by another
+    process" (and the POSIX equivalent race on Linux)."""
+    import shutil
+    import tempfile
+
+    src = shutil.which("chromedriver")
+    if not src:
+        from webdriver_manager.chrome import ChromeDriverManager
+
+        src = ChromeDriverManager(chrome_type=chrome_type).install()
+
+    exe_suffix = ".exe" if src.lower().endswith(".exe") else ""
+    writable_copy = os.path.join(tempfile.gettempdir(), f"uc_chromedriver_{unique_key}{exe_suffix}")
+
+    # A same-slot retry can land here while the previous attempt's
+    # chromedriver process is still finishing shutdown and briefly holding
+    # this same path open - retry the copy a few times rather than failing
+    # the whole scrape attempt over a transient file lock.
+    last_exc = None
+    for _ in range(3):
+        try:
+            shutil.copy2(src, writable_copy)
+            os.chmod(writable_copy, 0o755)
+            return writable_copy
+        except OSError as exc:
+            last_exc = exc
+            time.sleep(1)
+    raise last_exc
+
+
+def _make_driver(headless: bool = True, user_data_dir: str | None = None):
+    import threading
+
+    import undetected_chromedriver as uc
 
     binary_path, chrome_type = _detect_chrome_binary()
+    unique_key = os.path.basename(user_data_dir) if user_data_dir else str(threading.get_ident())
+    driver_path = _resolve_driver_path(chrome_type, unique_key)
 
-    opts = webdriver.ChromeOptions()
-    if binary_path:
-        opts.binary_location = binary_path
-    if headless:
-        opts.add_argument("--headless=new")
+    opts = uc.ChromeOptions()
     opts.add_argument("--window-size=1440,900")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--lang=en-IN")
     opts.add_argument("--accept-lang=en-IN,en;q=0.9")
-    opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
 
-    # On the VPS (Nixpacks), nix's "chromium" package already bundles a matching
-    # chromedriver in the Nix store, built against that environment's dynamic
-    # linker. A driver downloaded by webdriver_manager is a generic Linux binary
-    # that fails to exec there (WebDriverException: status code 127) - so prefer
-    # the nix-provided binary and only fall back to webdriver_manager (e.g. on a
-    # dev machine with real Google Chrome) when nothing is found on PATH.
-    driver_path = shutil.which("chromedriver")
-    if not driver_path:
-        from webdriver_manager.chrome import ChromeDriverManager
-
-        driver_path = ChromeDriverManager(chrome_type=chrome_type).install()
-
-    service = Service(driver_path)
-    driver = webdriver.Chrome(service=service, options=opts)
+    # undetected_chromedriver's own patching (stripped cdc_ variables, spoofed
+    # driver signature) is what actually evades Amazon's automation checks -
+    # plain Selenium's excludeSwitches/useAutomationExtension flags alone are
+    # not enough anymore. uc handles the navigator.webdriver override itself.
+    driver = uc.Chrome(
+        options=opts,
+        headless=headless,
+        driver_executable_path=driver_path,
+        browser_executable_path=binary_path or None,
+        user_data_dir=user_data_dir,
+        use_subprocess=True,
+    )
     driver.set_page_load_timeout(30)
-    driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return driver
+
+
+def _close_driver(driver) -> None:
+    """driver.quit() alone isn't reliable at actually killing the underlying
+    Chrome process tree - confirmed by direct reproduction: dozens of
+    orphaned chrome.exe/chromedriver.exe processes accumulated across a test
+    session even though every scrape called driver.quit() in a finally
+    block. Explicitly kill the browser process (and children) via psutil as
+    a safety net so a long-running worker pool can't slowly exhaust memory
+    on the VPS from leaked Chrome processes."""
+    browser_pid = getattr(driver, "browser_pid", None)
+    try:
+        driver.quit()
+    except Exception as exc:  # noqa: BLE001
+        log.debug("driver.quit() raised (continuing to process-kill fallback): %s", exc)
+
+    if not browser_pid:
+        return
+    try:
+        import psutil
+
+        proc = psutil.Process(browser_pid)
+        children = proc.children(recursive=True)
+        for child in children:
+            try:
+                child.kill()
+            except psutil.NoSuchProcess:
+                pass
+        try:
+            proc.kill()
+        except psutil.NoSuchProcess:
+            pass
+    except Exception as exc:  # noqa: BLE001 - best-effort cleanup, never fail the scrape over this
+        log.debug("Process-kill fallback failed for pid %s: %s", browser_pid, exc)
 
 
 def _human_delay(min_s: float = 2.0, max_s: float = 4.5) -> None:
@@ -241,7 +313,11 @@ def _parse_reviews_page(html: str) -> list[ScrapedReview]:
     soup = BeautifulSoup(html, "lxml")
     reviews: list[ScrapedReview] = []
 
-    for card in soup.select('div[data-hook="review"]'):
+    # The product page's own widget uses <div data-hook="review">, but the
+    # full "Customer reviews" listing page uses <li data-hook="review"> -
+    # match on the attribute alone so both work (confirmed by direct
+    # reproduction of both page types).
+    for card in soup.select('[data-hook="review"]'):
         try:
             review_id = card.get("id", "")
             if not review_id:
@@ -320,39 +396,179 @@ def _parse_reviews_page(html: str) -> list[ScrapedReview]:
     return reviews
 
 
-def scrape_amazon_product(product_url_or_asin: str, headless: bool = True) -> dict:
+MAX_LOAD_MORE_CLICKS = 30  # ~10 reviews/click -> up to ~300 reviews per product
+
+
+def _open_all_reviews_page(driver, asin: str) -> bool:
+    """From an already-loaded /dp/{asin} page (with an established browsing
+    session), navigate to the full "Customer reviews" listing - this page
+    exposes every review via a "Show N more reviews" button, unlike the
+    product page's own widget which only ever surfaces ~8-10 reviews.
+
+    Confirmed by direct reproduction that the "see all reviews" link on the
+    product page is /portal/customer-reviews/{asin}/...?reviewerType=all_reviews
+    - clicking it isn't reliable in a headless viewport (the link can be
+    off-screen and Selenium's .click() silently no-ops instead of
+    navigating), so this constructs and navigates to that URL directly
+    rather than finding/clicking the element.
+
+    Returns True if the page loaded without landing on a sign-in wall,
+    False otherwise (falls back to whatever scrape_amazon_product already
+    parsed from the product page itself)."""
+    driver.get(f"{BASE_URL}/portal/customer-reviews/{asin}/?ie=UTF8&reviewerType=all_reviews")
+    _human_delay(1.5, 3.0)
+
+    if "sign-in" in driver.current_url.lower() or "ap/signin" in driver.current_url.lower():
+        log.info("All-reviews page redirected to sign-in for ASIN %s - using product-page reviews only.", asin)
+        return False
+    return True
+
+
+def _load_more_reviews(driver) -> list:
+    """Repeatedly click the "Show N more reviews" button on the all-reviews
+    page, collecting every review card seen so far after each click, until
+    the button disappears, stops adding new reviews, or a CAPTCHA/hard cap
+    is hit. Returns the deduped list of ScrapedReview across all pages."""
+    from selenium.common.exceptions import ElementClickInterceptedException, NoSuchElementException
+    from selenium.webdriver.common.by import By
+
+    seen_ids: set[str] = set()
+    all_reviews: list = []
+
+    def _collect() -> None:
+        for r in _parse_reviews_page(driver.page_source):
+            if r.review_id not in seen_ids:
+                seen_ids.add(r.review_id)
+                all_reviews.append(r)
+
+    _collect()
+
+    button_selectors = [
+        '[data-hook="show-more-button"]',
+        '[data-hook="cr-pagination-more-reviews-trigger"]',
+        "//span[contains(text(), 'more reviews')]/ancestor::*[self::button or self::a][1]",
+        "//span[contains(text(), 'more review')]/ancestor::*[self::button or self::a][1]",
+    ]
+
+    for _ in range(MAX_LOAD_MORE_CLICKS):
+        if _is_captcha(driver):
+            log.warning("CAPTCHA hit while paginating reviews - stopping with %s collected so far.", len(all_reviews))
+            break
+
+        button = None
+        for selector in button_selectors:
+            try:
+                if selector.startswith("//"):
+                    button = driver.find_element(By.XPATH, selector)
+                else:
+                    button = driver.find_element(By.CSS_SELECTOR, selector)
+                break
+            except NoSuchElementException:
+                continue
+        if button is None:
+            break
+
+        before = len(all_reviews)
+        try:
+            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", button)
+            _human_delay(0.3, 0.8)
+            button.click()
+        except ElementClickInterceptedException:
+            driver.execute_script("arguments[0].click();", button)
+        _human_delay(1.5, 3.0)
+        _collect()
+
+        if len(all_reviews) == before:
+            break  # button present but nothing new loaded - avoid an infinite click loop
+
+    return all_reviews
+
+
+DEFAULT_COOKIES_PATH = os.environ.get("AMAZON_COOKIES_PATH", "amazon_cookies.json")
+
+
+def _load_cookies(driver, cookies_path: str) -> bool:
+    """Load exported Amazon session cookies (e.g. from the "Cookie-Editor"
+    or "Get cookies.txt LOCALLY" browser extension's JSON export) into the
+    driver so it inherits a real logged-in session - required to reach the
+    full "Customer reviews" listing page, which redirects a logged-out
+    session to a sign-in wall (confirmed by direct reproduction).
+
+    Must be called with the driver already on an amazon.in page (cookies
+    can only be added for the currently-loaded domain). Never handles a
+    password - only pre-existing session cookies the user exported
+    themselves from their own already-logged-in browser."""
+    import json
+
+    if not os.path.exists(cookies_path):
+        return False
+
+    try:
+        with open(cookies_path, encoding="utf-8") as f:
+            cookies = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Could not read cookies file %s: %s", cookies_path, exc)
+        return False
+
+    loaded = 0
+    for c in cookies:
+        cookie = {"name": c["name"], "value": c["value"], "path": c.get("path", "/")}
+        if c.get("domain"):
+            cookie["domain"] = c["domain"]
+        if "expirationDate" in c:
+            cookie["expiry"] = int(c["expirationDate"])
+        try:
+            driver.add_cookie(cookie)
+            loaded += 1
+        except Exception as exc:  # noqa: BLE001 - one bad cookie shouldn't block the rest
+            log.debug("Skipped cookie %s: %s", c.get("name"), exc)
+
+    log.info("Loaded %s/%s cookies from %s.", loaded, len(cookies), cookies_path)
+    return loaded > 0
+
+
+def scrape_amazon_product(
+    product_url_or_asin: str, headless: bool = True, user_data_dir: str | None = None,
+    full_reviews: bool = True, cookies_path: str | None = None,
+) -> dict:
     """Load an Amazon product page once and return both the review cards and
     the rating-histogram summary (5/4/3/2/1-star percentages, average
     rating, total ratings) from that single page load.
 
-    Amazon.in's dedicated /product-reviews/{asin} page redirects to a
-    sign-in wall when hit directly without an established browsing session
-    (confirmed by direct reproduction - title comes back "Amazon Sign-In",
-    even with a valid cookie-free Chrome profile and no CAPTCHA involved).
-    The product detail page (/dp/{asin}) itself embeds both the "Top
-    reviews from India" widget and the rating histogram with no such wall,
-    so that's the source for everything here. Reviews returned are the
-    ~4-10 Amazon surfaces on that widget (most helpful/recent), not a full
-    historical export - good enough for tracking new reviews day to day.
+    The rating histogram always comes from the product page's own widget.
+    For reviews: if full_reviews=True (default), after loading /dp/{asin}
+    this clicks through to the "Customer reviews" listing (the "See all
+    reviews" link) and repeatedly clicks "Show N more reviews" there,
+    collecting every review card seen - not just the ~8-10 the product page
+    itself surfaces. Hitting that page cold/logged-out used to redirect to a
+    sign-in wall; going through the product page first with an established
+    browsing session (and undetected_chromedriver) avoids that in practice.
+    Falls back to the product page's own ~8-10 reviews if the "see all
+    reviews" link isn't found or a CAPTCHA interrupts pagination.
 
-    Returns {"asin": ..., "reviews": [ScrapedReview, ...], "rating_summary": {...}}.
-    rating_summary is {} if the product has no ratings at all (e.g. a new
-    listing with zero reviews - confirmed this happens for real listings,
-    not a scraper bug).
+    Returns {"asin": ..., "reviews": [ScrapedReview, ...], "rating_summary": {...},
+    "blocked": bool}. rating_summary/reviews can legitimately both be empty
+    for a real product with zero reviews yet (confirmed this happens for
+    real listings, not a scraper bug) - "blocked" is what actually
+    distinguishes a CAPTCHA/load failure (retriable, no real data) from a
+    successful load of a genuinely empty product page (done, zero results).
     """
     asin = extract_asin(product_url_or_asin)
     if not asin:
         log.warning("Could not extract ASIN from %s", product_url_or_asin)
-        return {"asin": "", "reviews": [], "rating_summary": {}}
+        return {"asin": "", "reviews": [], "rating_summary": {}, "blocked": True}
 
-    driver = _make_driver(headless=headless)
+    driver = _make_driver(headless=headless, user_data_dir=user_data_dir)
     try:
         try:
             driver.get(BASE_URL)
             _human_delay(1.5, 3.0)
+            if _load_cookies(driver, cookies_path or DEFAULT_COOKIES_PATH):
+                driver.get(BASE_URL)  # reload with the session cookies now attached
+                _human_delay(1.0, 2.0)
         except Exception as exc:  # noqa: BLE001
             log.warning("Homepage load failed for ASIN %s: %s", asin, exc)
-            return {"asin": asin, "reviews": [], "rating_summary": {}}
+            return {"asin": asin, "reviews": [], "rating_summary": {}, "blocked": True}
 
         # A page that never times out on Amazon's end is unusual; retry a
         # couple of times before giving up on this product for this run.
@@ -366,21 +582,32 @@ def scrape_amazon_product(product_url_or_asin: str, headless: bool = True) -> di
             except Exception as exc:  # noqa: BLE001
                 log.warning("Product page load failed for ASIN %s (attempt %s): %s", asin, attempt, exc)
                 if attempt == 3:
-                    return {"asin": asin, "reviews": [], "rating_summary": {}}
+                    return {"asin": asin, "reviews": [], "rating_summary": {}, "blocked": True}
                 time.sleep(5)
 
         if _is_captcha(driver):
             log.warning("CAPTCHA hit for ASIN %s - will retry next run.", asin)
-            return {"asin": asin, "reviews": [], "rating_summary": {}}
+            return {"asin": asin, "reviews": [], "rating_summary": {}, "blocked": True}
 
-        html = driver.page_source
+        # Rating histogram lives on the product page itself either way - grab
+        # it before possibly navigating away to the all-reviews listing.
+        rating_summary = parse_rating_summary(driver.page_source)
+
+        reviews = _parse_reviews_page(driver.page_source)
+        if full_reviews and _open_all_reviews_page(driver, asin):
+            if _is_captcha(driver):
+                log.warning("CAPTCHA hit opening all-reviews page for ASIN %s - using product-page reviews only.", asin)
+            else:
+                reviews = _load_more_reviews(driver)
+
         return {
             "asin": asin,
-            "reviews": _parse_reviews_page(html),
-            "rating_summary": parse_rating_summary(html),
+            "reviews": reviews,
+            "rating_summary": rating_summary,
+            "blocked": False,
         }
     finally:
-        driver.quit()
+        _close_driver(driver)
 
 
 def scrape_amazon_reviews(product_url_or_asin: str, headless: bool = True, max_pages: int = MAX_REVIEW_PAGES) -> list[ScrapedReview]:

@@ -7,4 +7,4 @@ cmds = [
 ]
 
 [start]
-cmd = "export PATH=/opt/venv/bin:$PATH && python run_scheduler.py"
+cmd = "export PATH=/opt/venv/bin:$PATH && uvicorn dashboard:app --host 0.0.0.0 --port ${PORT:-8000}"
