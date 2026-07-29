@@ -25,6 +25,15 @@ app = FastAPI(title="Amazon Review Scraper")
 
 @app.on_event("startup")
 def _startup() -> None:
+    from amazon_reviews import prepare_shared_driver
+
+    # Synchronous, single-threaded, before any worker thread exists - see
+    # the design note above prepare_shared_driver() in amazon_reviews.py for
+    # why this replaced per-attempt driver resolution/patching.
+    log.info("Preparing shared chromedriver (one-time setup)...")
+    prepare_shared_driver()
+    log.info("Shared chromedriver ready.")
+
     start_background_thread()
 
 
@@ -37,6 +46,7 @@ def api_logs(after_id: int = 0, limit: int = 500) -> list[dict]:
 def api_stats() -> dict:
     stats = jobs.get_stats()
     stats["paused"] = jobs.is_paused()
+    stats["cookies"] = jobs.get_cookies_status()
     return stats
 
 
@@ -54,6 +64,34 @@ def api_jobs(
 @app.get("/api/control/settings")
 def api_get_settings() -> dict:
     return jobs.get_control()
+
+
+@app.get("/api/cookies/status")
+def api_cookies_status() -> dict:
+    return jobs.get_cookies_status()
+
+
+@app.post("/api/cookies")
+def api_set_cookies(cookies: list[dict]) -> dict:
+    if not cookies:
+        raise HTTPException(status_code=400, detail="Cookie list is empty")
+    for c in cookies:
+        if "name" not in c or "value" not in c:
+            raise HTTPException(status_code=400, detail="Each cookie needs at least a 'name' and 'value' field")
+    jobs.set_cookies(cookies)
+    return jobs.get_cookies_status()
+
+
+@app.post("/api/cookies/test")
+def api_test_cookies() -> dict:
+    from amazon_reviews import check_cookies_valid
+
+    cookies = jobs.get_cookies()
+    if not cookies:
+        raise HTTPException(status_code=400, detail="No cookies saved yet")
+    ok = check_cookies_valid(cookies)
+    jobs.set_cookies_check_result(ok)
+    return jobs.get_cookies_status()
 
 
 @app.post("/api/control/settings")
@@ -173,6 +211,11 @@ _DASHBOARD_HTML = """<!doctype html>
   .terminal .lvl-ERROR, .terminal .lvl-CRITICAL { color: #ef4444; }
   .terminal .ts { color: #4b5563; }
   .terminal .src { color: #3b82f6; }
+  textarea { width: 100%; min-height: 160px; font-family: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace; font-size: 12px; padding: 10px; box-sizing: border-box; resize: vertical; }
+  .status-badge { padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 500; }
+  .status-badge.ok { background: #15803d; }
+  .status-badge.bad { background: #b91c1c; }
+  .status-badge.unknown { background: #374151; }
 </style>
 </head>
 <body>
@@ -217,6 +260,22 @@ _DASHBOARD_HTML = """<!doctype html>
     <label style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="autoscroll-toggle" checked style="min-width:auto;width:auto"> Auto-scroll</label>
   </div>
   <div id="terminal" class="terminal"></div>
+</div>
+
+<div class="section" id="section-cookies" style="display:none">
+  <div class="panel">
+    <div class="panel-title">Session cookie status</div>
+    <div id="cookies-status" class="row"></div>
+  </div>
+  <div class="panel">
+    <div class="panel-title">Update cookies — paste either the raw "name=value; name2=value2" cookie string (copied from DevTools/Network tab) or a JSON array export (Cookie-Editor / "Get cookies.txt LOCALLY")</div>
+    <textarea id="cookies-input" placeholder='session-id=...; at-acbin=...; session-token=...   OR   [{"name": "session-id", "value": "...", "domain": ".amazon.in", "path": "/"}, ...]'></textarea>
+    <div class="row" style="margin-top:10px">
+      <button onclick="saveCookies()">Save Cookies</button>
+      <button onclick="testCookies()">Test Cookies</button>
+      <span id="cookies-msg" class="muted"></span>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -304,9 +363,12 @@ function selectTab(status) {
   activeTab = status;
   STATUSES.forEach(s => document.getElementById(`section-${s}`).style.display = s === status ? 'block' : 'none');
   document.getElementById('section-terminal').style.display = status === 'terminal' ? 'block' : 'none';
+  document.getElementById('section-cookies').style.display = status === 'cookies' ? 'block' : 'none';
   renderTabs();
   if (status === 'terminal') {
     refreshTerminal();
+  } else if (status === 'cookies') {
+    refreshCookiesStatus();
   } else {
     refreshSection(status);
   }
@@ -318,10 +380,11 @@ function renderTabs() {
       <span class="count muted" id="tabcount-${s}"></span>
     </div>
   `).join('');
-  const terminalTab = `
+  const extraTabs = `
     <div class="tab ${activeTab === 'terminal' ? 'active' : ''}" onclick="selectTab('terminal')">Terminal</div>
+    <div class="tab ${activeTab === 'cookies' ? 'active' : ''}" onclick="selectTab('cookies')">Cookies</div>
   `;
-  document.getElementById('tabs').innerHTML = statusTabs + terminalTab;
+  document.getElementById('tabs').innerHTML = statusTabs + extraTabs;
 }
 
 function sortByColumn(status, key) {
@@ -399,12 +462,25 @@ async function refreshSection(status) {
   `).join('');
 }
 
+function cookieStatusCard(c) {
+  let label, cls;
+  if (!c || !c.present) { label = 'Not set'; cls = 'unknown'; }
+  else if (c.last_check_ok === null || c.last_check_ok === undefined) { label = 'Untested'; cls = 'unknown'; }
+  else if (c.last_check_ok) { label = 'Working'; cls = 'ok'; }
+  else { label = 'Invalid'; cls = 'bad'; }
+  return `<div class="card" style="cursor:pointer" onclick="selectTab('cookies')">
+    <div class="n" style="padding-top:2px"><span class="status-badge ${cls}">${label}</span></div>
+    <div class="l">session cookies</div>
+  </div>`;
+}
 async function refreshAll() {
   const stats = await (await fetch('/api/stats')).json();
   document.getElementById('paused-banner').style.display = stats.paused ? 'block' : 'none';
   document.getElementById('stats').innerHTML = STATUSES.map(k =>
     `<div class="card"><div class="n">${stats[k] ?? 0}</div><div class="l">${k}</div></div>`
-  ).join('') + `<div class="card"><div class="n">${stats.total_reviews_found ?? 0}</div><div class="l">total reviews found</div></div>`;
+  ).join('')
+    + `<div class="card"><div class="n">${stats.total_reviews_found ?? 0}</div><div class="l">total reviews found</div></div>`
+    + cookieStatusCard(stats.cookies);
 
   STATUSES.forEach(s => {
     const el = document.getElementById(`tabcount-${s}`);
@@ -445,6 +521,92 @@ async function refreshTerminal() {
 
   if (document.getElementById('autoscroll-toggle').checked && atBottom) {
     term.scrollTop = term.scrollHeight;
+  }
+}
+
+function renderCookiesStatus(s) {
+  const badge = s.last_check_ok === null || s.last_check_ok === undefined
+    ? `<span class="status-badge unknown">Untested</span>`
+    : s.last_check_ok
+      ? `<span class="status-badge ok">Working</span>`
+      : `<span class="status-badge bad">Expired / Invalid</span>`;
+  document.getElementById('cookies-status').innerHTML = `
+    <div class="card"><div class="n">${s.present ? s.count : 0}</div><div class="l">cookies stored</div></div>
+    <div class="card"><div class="n" style="font-size:14px;padding-top:4px">${s.updated_at ? new Date(s.updated_at).toLocaleString() : 'never'}</div><div class="l">last updated</div></div>
+    <div class="card"><div class="n" style="padding-top:6px">${badge}</div><div class="l">status ${s.last_check_at ? '(' + new Date(s.last_check_at).toLocaleString() + ')' : ''}</div></div>
+  `;
+}
+async function refreshCookiesStatus() {
+  const s = await (await fetch('/api/cookies/status')).json();
+  renderCookiesStatus(s);
+}
+function parseRawCookieHeader(text) {
+  // Accepts the raw "name=value; name2=value2" string you copy straight out
+  // of a browser's DevTools (Network tab request header, or the address-bar
+  // cookie string) - not just the JSON array export format.
+  const cookies = [];
+  for (const part of text.split(';')) {
+    const trimmed = part.trim();
+    const eq = trimmed.indexOf('=');
+    if (eq <= 0) continue;
+    cookies.push({
+      name: trimmed.slice(0, eq).trim(),
+      value: trimmed.slice(eq + 1).trim(),
+      domain: '.amazon.in',
+      path: '/',
+    });
+  }
+  return cookies;
+}
+async function saveCookies() {
+  const msg = document.getElementById('cookies-msg');
+  const raw = document.getElementById('cookies-input').value.trim();
+  let cookies;
+  try {
+    cookies = JSON.parse(raw);
+  } catch (e) {
+    cookies = parseRawCookieHeader(raw);
+    if (!cookies.length) {
+      msg.textContent = "Couldn't parse as JSON or as a raw 'name=value; ...' cookie string.";
+      return;
+    }
+  }
+  const resp = await fetch('/api/cookies', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cookies),
+  });
+  if (!resp.ok) {
+    const err = await resp.json();
+    msg.textContent = 'Error: ' + (err.detail || resp.statusText);
+    return;
+  }
+  const s = await resp.json();
+  renderCookiesStatus(s);
+  msg.textContent = 'Saved.';
+  setTimeout(() => msg.textContent = '', 3000);
+}
+async function testCookies() {
+  const msg = document.getElementById('cookies-msg');
+  const startedAt = Date.now();
+  const tick = setInterval(() => {
+    const secs = Math.floor((Date.now() - startedAt) / 1000);
+    msg.textContent = `Testing... ${secs}s elapsed (opens a real browser - can take much longer than usual while other scrapes are running concurrently)`;
+  }, 1000);
+  msg.textContent = 'Testing...';
+
+  try {
+    const resp = await fetch('/api/cookies/test', { method: 'POST' });
+    clearInterval(tick);
+    if (!resp.ok) {
+      const err = await resp.json();
+      msg.textContent = 'Error: ' + (err.detail || resp.statusText);
+      return;
+    }
+    const s = await resp.json();
+    renderCookiesStatus(s);
+    msg.textContent = s.last_check_ok ? 'Cookies are working.' : 'Cookies are expired or invalid - export fresh ones.';
+  } catch (e) {
+    clearInterval(tick);
+    msg.textContent = 'Request failed: ' + e.message;
   }
 }
 

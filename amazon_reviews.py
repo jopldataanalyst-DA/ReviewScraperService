@@ -26,6 +26,20 @@ from bs4 import BeautifulSoup
 
 log = logging.getLogger("amazon_reviews_scraper")
 
+# Force setuptools' distutils shim to register once, deterministically, at
+# module load time (single-threaded, before any concurrent worker calls
+# _make_driver) rather than relying on it happening implicitly via a .pth
+# hook at interpreter startup. Confirmed by direct reproduction: under
+# concurrent load, `import undetected_chromedriver` (which needs
+# `distutils`, removed from the stdlib in Python 3.12) can fail once
+# transiently - and because a failed import leaves the module half-
+# registered in sys.modules, every later import in that same process then
+# fails identically forever, even though the root cause was momentary.
+try:
+    import setuptools  # noqa: F401
+except ImportError:
+    pass
+
 
 @dataclass
 class ScrapedReview:
@@ -82,27 +96,56 @@ def _detect_chrome_binary() -> tuple[str | None, str]:
     return None, ChromeType.GOOGLE
 
 
-def _resolve_driver_path(chrome_type, unique_key: str) -> str | None:
-    """Find a chromedriver binary and hand undetected_chromedriver a writable
-    copy of it to patch in-place.
+# --- One-time, single-threaded driver setup -------------------------------
+#
+# Redesigned after extensive direct reproduction showed that resolving and
+# copying/patching the chromedriver binary on EVERY scrape attempt was the
+# common root of every intermittent failure mode seen under concurrent load
+# (WinError 32 file-copy collisions, and near-certainly the sporadic
+# "No module named 'distutils'" import failures too - both cluster around
+# this exact hot path, and neither reproduces in isolation or at low
+# concurrency, only under sustained multi-worker load). Rather than layering
+# more retry/self-heal logic onto a fundamentally racy per-call operation,
+# this resolves the source binary, imports undetected_chromedriver, and lets
+# uc patch ONE stable copy of the driver exactly once - synchronously,
+# single-threaded, at process startup, before any worker thread exists.
+# Every subsequent driver launch just points at that same already-patched,
+# read-only-in-practice file. No repeated copies, no repeated first-imports,
+# no concurrency exposure in this path at all after startup.
 
-    On the VPS (Nixpacks), nix's "chromium" package already bundles a
-    matching chromedriver in the Nix store, built against that environment's
-    dynamic linker - a driver downloaded by webdriver_manager there is a
-    generic Linux binary that fails to exec (WebDriverException: status code
-    127). Either way, undetected_chromedriver patches whatever binary it's
-    given in-place, and neither the read-only Nix store nor (on Windows,
-    confirmed by direct reproduction) webdriver_manager's own cache
-    directory reliably allow that - so always work off a fresh writable
-    temp copy rather than the original path.
+_shared_driver_path: str | None = None
+_shared_binary_path: str | None = None
+_shared_chrome_type = None
+_uc_module = None  # cached undetected_chromedriver module object - see prepare_shared_driver
 
-    unique_key must be distinct per concurrent worker (e.g. derived from its
-    user_data_dir) - confirmed by direct reproduction that concurrent
-    workers sharing one hardcoded copy path collide with "WinError 32: The
-    process cannot access the file because it is being used by another
-    process" (and the POSIX equivalent race on Linux)."""
+
+def prepare_shared_driver() -> None:
+    """Call once, synchronously, before starting any concurrent workers.
+    Resolves the Chrome binary, imports undetected_chromedriver, and patches
+    one stable chromedriver copy. Raises if this fails - better to fail loud
+    at startup than to silently fail every job later.
+
+    Caches the imported module object in _uc_module so every later call in
+    _launch_chrome uses that direct reference instead of re-executing an
+    `import undetected_chromedriver` statement per call - even though a
+    repeat import of an already-cached module is normally an instant
+    sys.modules lookup, direct reproduction showed sporadic
+    "No module named 'distutils'" failures persisting under sustained
+    concurrent load even after eliminating every other per-call import/copy
+    in this path, so this removes the last remaining per-call import
+    statement in the hot concurrent path entirely."""
     import shutil
     import tempfile
+
+    global _shared_driver_path, _shared_binary_path, _shared_chrome_type, _uc_module
+
+    import undetected_chromedriver as uc  # import once, here, single-threaded
+
+    _uc_module = uc
+
+    binary_path, chrome_type = _detect_chrome_binary()
+    _shared_binary_path = binary_path
+    _shared_chrome_type = chrome_type
 
     src = shutil.which("chromedriver")
     if not src:
@@ -111,32 +154,24 @@ def _resolve_driver_path(chrome_type, unique_key: str) -> str | None:
         src = ChromeDriverManager(chrome_type=chrome_type).install()
 
     exe_suffix = ".exe" if src.lower().endswith(".exe") else ""
-    writable_copy = os.path.join(tempfile.gettempdir(), f"uc_chromedriver_{unique_key}{exe_suffix}")
+    stable_path = os.path.join(tempfile.gettempdir(), f"uc_chromedriver_shared{exe_suffix}")
+    shutil.copy2(src, stable_path)
+    os.chmod(stable_path, 0o755)
 
-    # A same-slot retry can land here while the previous attempt's
-    # chromedriver process is still finishing shutdown and briefly holding
-    # this same path open - retry the copy a few times rather than failing
-    # the whole scrape attempt over a transient file lock.
-    last_exc = None
-    for _ in range(3):
-        try:
-            shutil.copy2(src, writable_copy)
-            os.chmod(writable_copy, 0o755)
-            return writable_copy
-        except OSError as exc:
-            last_exc = exc
-            time.sleep(1)
-    raise last_exc
+    # Force the patch (strip cdc_ signatures etc.) to happen now, once, by
+    # actually launching and closing a real headless Chrome instance against
+    # this file - the same code path _make_driver uses, just done eagerly
+    # and synchronously so every later concurrent call skips straight to a
+    # pre-patched binary instead of racing to patch it themselves.
+    test_driver = _launch_chrome(stable_path, binary_path, headless=True, user_data_dir=None)
+    _close_driver(test_driver)
+
+    _shared_driver_path = stable_path
+    log.info("Shared chromedriver prepared and patched at %s", stable_path)
 
 
-def _make_driver(headless: bool = True, user_data_dir: str | None = None):
-    import threading
-
-    import undetected_chromedriver as uc
-
-    binary_path, chrome_type = _detect_chrome_binary()
-    unique_key = os.path.basename(user_data_dir) if user_data_dir else str(threading.get_ident())
-    driver_path = _resolve_driver_path(chrome_type, unique_key)
+def _launch_chrome(driver_path: str, binary_path: str | None, headless: bool, user_data_dir: str | None):
+    uc = _uc_module  # cached module reference - no import statement in this hot concurrent path
 
     opts = uc.ChromeOptions()
     opts.add_argument("--window-size=1440,900")
@@ -159,6 +194,58 @@ def _make_driver(headless: bool = True, user_data_dir: str | None = None):
     )
     driver.set_page_load_timeout(30)
     return driver
+
+
+_prepare_lock = None  # lazily created threading.Lock() - see _make_driver's fallback
+
+
+def _per_worker_driver_copy(unique_key: str) -> str:
+    """Copy the already-patched shared driver to a per-worker file.
+
+    undetected_chromedriver's Chrome() constructs a fresh Patcher and calls
+    .auto() on EVERY instantiation, not just once (confirmed by reading
+    undetected_chromedriver/__init__.py directly) - so even though
+    prepare_shared_driver() patches one binary up front, every concurrent
+    uc.Chrome() call still touches that file's patcher logic again. Multiple
+    workers doing that against the SAME file at the same time is exactly the
+    kind of concurrent-file-access collision that caused WinError 32 before
+    (and is the strongest remaining candidate for the sporadic
+    "No module named 'distutils'" failures too - both are symptoms of
+    concurrent access to one shared file, just surfacing through different
+    internal code paths). Copying from the now-stable, unchanging, already-
+    patched file (not the original webdriver_manager cache, which is what
+    caused the original collision) is fast and gives each worker an
+    independent file with no shared-access exposure at all."""
+    import shutil
+    import tempfile
+
+    exe_suffix = ".exe" if _shared_driver_path.lower().endswith(".exe") else ""
+    dest = os.path.join(tempfile.gettempdir(), f"uc_chromedriver_{unique_key}{exe_suffix}")
+    shutil.copy2(_shared_driver_path, dest)
+    os.chmod(dest, 0o755)
+    return dest
+
+
+def _make_driver(headless: bool = True, user_data_dir: str | None = None):
+    import threading
+
+    global _prepare_lock
+    if _shared_driver_path is None:
+        # Safety net (e.g. ad-hoc scripts/tests that never called
+        # prepare_shared_driver() explicitly) - do the one-time setup now
+        # instead of failing, guarded by a lock so concurrent callers don't
+        # race each other into doing it twice. In the real worker pool this
+        # should never trigger, since dashboard.py calls
+        # prepare_shared_driver() at startup before any worker thread exists.
+        if _prepare_lock is None:
+            _prepare_lock = threading.Lock()
+        with _prepare_lock:
+            if _shared_driver_path is None:
+                prepare_shared_driver()
+
+    unique_key = os.path.basename(user_data_dir) if user_data_dir else str(threading.get_ident())
+    per_worker_path = _per_worker_driver_copy(unique_key)
+    return _launch_chrome(per_worker_path, _shared_binary_path, headless, user_data_dir)
 
 
 def _close_driver(driver) -> None:
@@ -396,6 +483,25 @@ def _parse_reviews_page(html: str) -> list[ScrapedReview]:
     return reviews
 
 
+def check_cookies_valid(cookies: list, headless: bool = True) -> bool:
+    """Real live check of whether a set of session cookies is still valid -
+    loads them, reloads the homepage, and looks for Amazon's own logged-out
+    indicator ("Hello, sign in" in the nav greeting) rather than depending
+    on any specific product page. Used by the dashboard's "Test Cookies"
+    button. Always closes its own driver."""
+    driver = _make_driver(headless=headless)
+    try:
+        driver.get(BASE_URL)
+        _human_delay(1.0, 2.0)
+        if not _load_cookies(driver, cookies=cookies):
+            return False
+        driver.get(BASE_URL)
+        _human_delay(1.5, 3.0)
+        return "hello, sign in" not in driver.page_source.lower()
+    finally:
+        _close_driver(driver)
+
+
 MAX_LOAD_MORE_CLICKS = 30  # ~10 reviews/click -> up to ~300 reviews per product
 
 
@@ -487,12 +593,16 @@ def _load_more_reviews(driver) -> list:
 DEFAULT_COOKIES_PATH = os.environ.get("AMAZON_COOKIES_PATH", "amazon_cookies.json")
 
 
-def _load_cookies(driver, cookies_path: str) -> bool:
+def _load_cookies(driver, cookies=None, cookies_path: str | None = None) -> bool:
     """Load exported Amazon session cookies (e.g. from the "Cookie-Editor"
-    or "Get cookies.txt LOCALLY" browser extension's JSON export) into the
-    driver so it inherits a real logged-in session - required to reach the
-    full "Customer reviews" listing page, which redirects a logged-out
-    session to a sign-in wall (confirmed by direct reproduction).
+    or "Get cookies.txt LOCALLY" browser extension's JSON export, or the
+    dashboard's Cookies panel) into the driver so it inherits a real
+    logged-in session - required to reach the full "Customer reviews"
+    listing page, which redirects a logged-out session to a sign-in wall
+    (confirmed by direct reproduction).
+
+    Pass `cookies` (a pre-loaded list, e.g. from the DB via jobs.get_cookies())
+    or `cookies_path` (a JSON file) - cookies takes priority if both given.
 
     Must be called with the driver already on an amazon.in page (cookies
     can only be added for the currently-loaded domain). Never handles a
@@ -500,14 +610,17 @@ def _load_cookies(driver, cookies_path: str) -> bool:
     themselves from their own already-logged-in browser."""
     import json
 
-    if not os.path.exists(cookies_path):
-        return False
+    if cookies is None:
+        if not cookies_path or not os.path.exists(cookies_path):
+            return False
+        try:
+            with open(cookies_path, encoding="utf-8") as f:
+                cookies = json.load(f)
+        except (OSError, json.JSONDecodeError) as exc:
+            log.warning("Could not read cookies file %s: %s", cookies_path, exc)
+            return False
 
-    try:
-        with open(cookies_path, encoding="utf-8") as f:
-            cookies = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        log.warning("Could not read cookies file %s: %s", cookies_path, exc)
+    if not cookies:
         return False
 
     loaded = 0
@@ -523,13 +636,13 @@ def _load_cookies(driver, cookies_path: str) -> bool:
         except Exception as exc:  # noqa: BLE001 - one bad cookie shouldn't block the rest
             log.debug("Skipped cookie %s: %s", c.get("name"), exc)
 
-    log.info("Loaded %s/%s cookies from %s.", loaded, len(cookies), cookies_path)
+    log.info("Loaded %s/%s cookies.", loaded, len(cookies))
     return loaded > 0
 
 
 def scrape_amazon_product(
     product_url_or_asin: str, headless: bool = True, user_data_dir: str | None = None,
-    full_reviews: bool = True, cookies_path: str | None = None,
+    full_reviews: bool = True, cookies: list | None = None, cookies_path: str | None = None,
 ) -> dict:
     """Load an Amazon product page once and return both the review cards and
     the rating-histogram summary (5/4/3/2/1-star percentages, average
@@ -563,7 +676,7 @@ def scrape_amazon_product(
         try:
             driver.get(BASE_URL)
             _human_delay(1.5, 3.0)
-            if _load_cookies(driver, cookies_path or DEFAULT_COOKIES_PATH):
+            if _load_cookies(driver, cookies=cookies, cookies_path=cookies_path or DEFAULT_COOKIES_PATH):
                 driver.get(BASE_URL)  # reload with the session cookies now attached
                 _human_delay(1.0, 2.0)
         except Exception as exc:  # noqa: BLE001

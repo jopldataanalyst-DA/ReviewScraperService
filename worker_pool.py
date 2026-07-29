@@ -139,10 +139,11 @@ def _scrape_with_retries(product_link: str, slot: int) -> tuple[dict, int, str]:
         try:
             result = scrape_amazon_product(
                 product_link, headless=True, user_data_dir=_profile_dir_for_slot(slot),
+                cookies=jobs.get_cookies(),
             )
             last_error = "CAPTCHA wall or page load failure" if result["blocked"] else ""
         except Exception as exc:  # noqa: BLE001 - e.g. transient Chrome/driver launch failure, still worth retrying
-            log.warning("Scrape attempt %s raised for %s: %s", attempt, product_link, exc)
+            log.exception("Scrape attempt %s raised for %s", attempt, product_link)
             result = {"asin": "", "reviews": [], "rating_summary": {}, "blocked": True}
             last_error = str(exc).splitlines()[0][:300]
 

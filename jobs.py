@@ -237,6 +237,57 @@ def set_control(date_from=None, date_to=None, max_reviews=None, max_workers=None
     return get_control()
 
 
+def get_cookies_status() -> dict:
+    """Metadata about the stored Amazon session cookies - never returns the
+    actual cookie values (those stay server-side, used only internally by
+    the scraper's own driver session)."""
+    rows = fetch_all(
+        f"""SELECT cookies_json, cookies_updated_at, cookies_last_check_ok, cookies_last_check_at
+            FROM {CONTROL_TABLE} WHERE id = 1"""
+    )
+    if not rows or not rows[0]["cookies_json"]:
+        return {
+            "present": False, "count": 0, "updated_at": None,
+            "last_check_ok": None, "last_check_at": None,
+        }
+    row = rows[0]
+    return {
+        "present": True,
+        "count": len(row["cookies_json"]),
+        "updated_at": row["cookies_updated_at"],
+        "last_check_ok": row["cookies_last_check_ok"],
+        "last_check_at": row["cookies_last_check_at"],
+    }
+
+
+def get_cookies() -> Optional[list]:
+    """The actual cookie list, for internal use by the scraper only - never
+    exposed via an API response."""
+    rows = fetch_all(f"SELECT cookies_json FROM {CONTROL_TABLE} WHERE id = 1")
+    return rows[0]["cookies_json"] if rows and rows[0]["cookies_json"] else None
+
+
+def set_cookies(cookies: list) -> None:
+    with get_cursor(commit=True) as cursor:
+        cursor.execute(
+            f"""UPDATE {CONTROL_TABLE}
+                SET cookies_json = %s, cookies_updated_at = now(),
+                    cookies_last_check_ok = NULL, cookies_last_check_at = NULL
+                WHERE id = 1""",
+            (psycopg2.extras.Json(cookies),),
+        )
+
+
+def set_cookies_check_result(ok: bool) -> None:
+    with get_cursor(commit=True) as cursor:
+        cursor.execute(
+            f"""UPDATE {CONTROL_TABLE}
+                SET cookies_last_check_ok = %s, cookies_last_check_at = now()
+                WHERE id = 1""",
+            (ok,),
+        )
+
+
 def reset_stuck_running(older_than_minutes: int = 30) -> int:
     """Safety net: if the process crashed mid-scrape, a job can be left stuck
     in 'running' forever. Anything running longer than this gets requeued."""
