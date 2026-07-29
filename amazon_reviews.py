@@ -127,6 +127,20 @@ def _human_delay(min_s: float = 2.0, max_s: float = 4.5) -> None:
     time.sleep(random.uniform(min_s, max_s))
 
 
+def _human_scroll(driver) -> None:
+    """Scroll down the page in irregular steps instead of jumping straight to
+    reading page_source. Reviews/rating-histogram widgets are lazy-loaded
+    below the fold, and a page that never scrolls is also a stronger bot
+    signal to Amazon than the pattern this mimics."""
+    total_height = driver.execute_script("return document.body.scrollHeight")
+    pos = 0
+    while pos < total_height:
+        step = random.randint(300, 600)
+        pos = min(pos + step, total_height)
+        driver.execute_script(f"window.scrollTo(0, {pos});")
+        time.sleep(random.uniform(0.15, 0.4))
+
+
 def _is_captcha(driver) -> bool:
     src = driver.page_source.lower()
     return (
@@ -336,12 +350,24 @@ def scrape_amazon_product(product_url_or_asin: str, headless: bool = True) -> di
         try:
             driver.get(BASE_URL)
             _human_delay(1.5, 3.0)
-            driver.get(f"{BASE_URL}/dp/{asin}")
         except Exception as exc:  # noqa: BLE001
-            log.warning("Page load failed for ASIN %s: %s", asin, exc)
+            log.warning("Homepage load failed for ASIN %s: %s", asin, exc)
             return {"asin": asin, "reviews": [], "rating_summary": {}}
 
-        _human_delay(2.0, 4.0)
+        # A page that never times out on Amazon's end is unusual; retry a
+        # couple of times before giving up on this product for this run.
+        for attempt in range(1, 4):
+            try:
+                driver.get(f"{BASE_URL}/dp/{asin}")
+                _human_delay(2.0, 4.0)
+                _human_scroll(driver)
+                _human_delay(0.5, 1.5)
+                break
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Product page load failed for ASIN %s (attempt %s): %s", asin, attempt, exc)
+                if attempt == 3:
+                    return {"asin": asin, "reviews": [], "rating_summary": {}}
+                time.sleep(5)
 
         if _is_captcha(driver):
             log.warning("CAPTCHA hit for ASIN %s - will retry next run.", asin)
