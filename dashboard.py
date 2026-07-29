@@ -8,6 +8,8 @@ Use case:
 """
 
 import logging
+import os
+import signal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
@@ -19,6 +21,30 @@ from worker_pool import start_background_thread
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("dashboard")
 log_buffer.install()
+
+
+def _reap_zombie_children(signum, frame) -> None:
+    """Chrome/chromedriver processes we kill via psutil never get wait()'d
+    on, so they stay <defunct> forever - their parent is this long-lived
+    process, not tini (tini only reaps re-parented orphans, never zombies
+    whose original parent is still alive). Confirmed by direct reproduction:
+    ps aux inside the deployed container showed 100+ accumulating
+    uc_chromedriver/chromium zombies even after adding tini, eventually
+    exhausting the process table so Chrome could launch but not fork a
+    renderer ("disconnected: unable to send message to renderer"). A SIGCHLD
+    handler reaps every child the instant it exits, regardless of who killed
+    it."""
+    try:
+        while True:
+            pid, _status = os.waitpid(-1, os.WNOHANG)
+            if pid == 0:
+                break
+    except ChildProcessError:
+        pass
+
+
+if hasattr(signal, "SIGCHLD"):
+    signal.signal(signal.SIGCHLD, _reap_zombie_children)
 
 app = FastAPI(title="Amazon Review Scraper")
 
