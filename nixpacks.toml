@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["python312", "chromium", "chromedriver"]
+nixPkgs = ["python312", "chromium", "chromedriver", "tini"]
 
 [phases.install]
 cmds = [
@@ -7,4 +7,16 @@ cmds = [
 ]
 
 [start]
-cmd = "export PATH=/opt/venv/bin:$PATH && uvicorn dashboard:app --host 0.0.0.0 --port ${PORT:-8000}"
+# tini as PID 1 is required here: without a real init process, zombie
+# children (every Chrome/chromedriver/crashpad process that exits) are
+# never reaped, since a plain Python/uvicorn process running as PID 1
+# doesn't take on init's wait()-reaping responsibility. Confirmed by direct
+# reproduction on the deployed container: `ps aux` showed dozens of
+# "<defunct>" zombie chromium/uc_chromedriver/chrome_crashpad processes
+# accumulating from every single scrape attempt, eventually exhausting the
+# process table enough that Chrome could launch its browser process but
+# could no longer successfully fork a renderer child - producing
+# "disconnected: unable to send message to renderer" on every navigation,
+# with zero trace in kernel logs (dmesg) since it's a pure userspace
+# process-table exhaustion, not an OOM-kill or security-policy denial.
+cmd = "export PATH=/opt/venv/bin:$PATH && exec tini -- uvicorn dashboard:app --host 0.0.0.0 --port ${PORT:-8000}"

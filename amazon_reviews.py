@@ -207,25 +207,13 @@ def _launch_chrome(driver_path: str, binary_path: str | None, headless: bool, us
     # driver signature) is what actually evades Amazon's automation checks -
     # plain Selenium's excludeSwitches/useAutomationExtension flags alone are
     # not enough anymore. uc handles the navigator.webdriver override itself.
-    #
-    # use_subprocess=False: confirmed by direct reproduction on the deployed
-    # Linux container that use_subprocess=True (uc's default) reliably
-    # produces "disconnected: unable to send message to renderer" on every
-    # single navigation - 100% failure, deterministic, regardless of
-    # concurrency (tested down to 1-2 workers) or available memory (tested
-    # up to 6GB limit). This is a well-documented undetected_chromedriver
-    # quirk specifically in Docker/CI-style containers: use_subprocess's
-    # process-group/session handling for the Chrome process doesn't play
-    # well with some container runtimes' process namespacing, breaking the
-    # DevTools websocket connection to the renderer. False lets uc manage
-    # the Chrome process the same way plain Selenium does.
     driver = uc.Chrome(
         options=opts,
         headless=headless,
         driver_executable_path=driver_path,
         browser_executable_path=binary_path or None,
         user_data_dir=user_data_dir,
-        use_subprocess=False,
+        use_subprocess=True,
     )
     driver.set_page_load_timeout(30)
     return driver
