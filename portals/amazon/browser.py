@@ -52,18 +52,27 @@ def start_xvfb() -> None:
     GPU/headless issue this function exists to work around - but with the
     real cause (Xvfb never came up) completely invisible in the logs.
     Captures Xvfb's own output now specifically so that failure is visible
-    instead of silently masquerading as a Chrome/renderer bug."""
+    instead of silently masquerading as a Chrome/renderer bug.
+
+    Deliberately does NOT trust a pre-existing DISPLAY env var as a signal
+    that a display is already available - confirmed by direct reproduction
+    on the deployed container: DISPLAY was already set to something (base
+    image default, unrelated to this function) before this ever ran, so the
+    old "if os.environ.get('DISPLAY'): return" guard skipped launching Xvfb
+    entirely, on every single call, with zero log output either way -
+    Chrome then pointed at a DISPLAY with no real X server behind it.
+    Idempotency is tracked via _xvfb_proc (our own process handle) instead."""
     global _xvfb_proc, _xvfb_lock
     import shutil
     import subprocess
     import threading
 
-    if os.environ.get("DISPLAY"):
-        return
+    if _xvfb_proc is not None and _xvfb_proc.poll() is None:
+        return  # our own Xvfb is already up
     if _xvfb_lock is None:
         _xvfb_lock = threading.Lock()
     with _xvfb_lock:
-        if os.environ.get("DISPLAY"):
+        if _xvfb_proc is not None and _xvfb_proc.poll() is None:
             return
         xvfb_path = shutil.which("Xvfb")
         if not xvfb_path:
