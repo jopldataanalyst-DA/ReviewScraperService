@@ -21,6 +21,12 @@ STATUS_RUNNING = "running"
 STATUS_DONE = "done"
 STATUS_FAILED = "failed"
 STATUS_CAPTCHA = "captcha"
+STATUS_NA = "na"  # page loaded fine (not blocked/CAPTCHA'd) but the product
+                   # genuinely has zero ratings and zero reviews - confirmed
+                   # by direct reproduction that some real listings have no
+                   # rating widget in the DOM at all. Kept separate from
+                   # STATUS_DONE so "has real data" and "confirmed empty"
+                   # aren't blended together in one bucket.
 
 
 def sync_jobs_from_mapping() -> int:
@@ -106,6 +112,23 @@ def mark_job_result(job_id: int, status: str, reviews_found: int = 0, error: Opt
         )
 
 
+def requeue_job(job_id: int, error: Optional[str] = None) -> None:
+    """Send a job that just failed one attempt straight back to 'pending'
+    (recording the error for visibility) instead of retrying it in place
+    while still marked 'running'. This is what actually frees the worker
+    slot immediately - the next claim_pending_jobs call picks up whatever
+    job is oldest, which is very often (but not necessarily) this same one,
+    rather than blocking that slot on repeated in-job retries of one
+    product. attempt_count (bumped by claim_pending_jobs on every claim) is
+    what eventually escalates a persistently-broken product to STATUS_FAILED
+    - see worker_pool.MAX_AUTO_REQUEUE_ATTEMPTS."""
+    with get_cursor(commit=True) as cursor:
+        cursor.execute(
+            f"UPDATE {JOBS_TABLE} SET status = %s, last_error = %s, updated_at = now() WHERE id = %s",
+            (STATUS_PENDING, error, job_id),
+        )
+
+
 def requeue_product(product_id: str) -> bool:
     """Trigger a specific product on demand by resetting its job to pending."""
     with get_cursor(commit=True) as cursor:
@@ -128,6 +151,26 @@ def requeue_failures() -> int:
 def requeue_all() -> int:
     with get_cursor(commit=True) as cursor:
         cursor.execute(f"UPDATE {JOBS_TABLE} SET status = %s, updated_at = now()", (STATUS_PENDING,))
+        return cursor.rowcount
+
+
+def requeue_stale_failures(older_than_minutes: int, max_attempts: int) -> int:
+    """Auto-requeue jobs that have sat in 'failed' for a while, capped by
+    attempt_count so a genuinely broken link doesn't retry forever. CAPTCHA
+    is a per-request probability, not a permanent flag on one product, so a
+    failure from N minutes ago is worth trying again on its own schedule
+    rather than needing a manual Retry Failed click."""
+    with get_cursor(commit=True) as cursor:
+        cursor.execute(
+            f"""
+            UPDATE {JOBS_TABLE}
+            SET status = %s, updated_at = now()
+            WHERE status = %s
+              AND attempt_count < %s
+              AND updated_at < now() - (%s || ' minutes')::interval
+            """,
+            (STATUS_PENDING, STATUS_FAILED, max_attempts, older_than_minutes),
+        )
         return cursor.rowcount
 
 
@@ -157,19 +200,38 @@ def list_jobs_page(
     conditions = []
     params: list = []
     if status:
-        conditions.append("status = %s")
+        conditions.append("j.status = %s")
         params.append(status)
     if search:
         conditions.append(
-            "(product_id ILIKE %s OR seller_sku ILIKE %s OR master_sku ILIKE %s OR company ILIKE %s)"
+            "(j.product_id ILIKE %s OR j.seller_sku ILIKE %s OR j.master_sku ILIKE %s OR j.company ILIKE %s)"
         )
         like = f"%{search}%"
         params.extend([like, like, like, like])
     where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
 
-    total = fetch_all(f"SELECT count(*) AS n FROM {JOBS_TABLE} {where}", tuple(params))[0]["n"]
+    # average_rating/total_ratings live in reviews.amazon_reviews (denormalized
+    # per review row, see run_scheduler.insert_new_reviews), not on the job
+    # itself - pull the one latest-scraped value per product so the jobs
+    # table can show rating context without a per-row join blowing up the count.
+    ratings_join = f"""
+        LEFT JOIN (
+            SELECT DISTINCT ON (product_id) product_id, average_rating, total_ratings
+            FROM reviews.amazon_reviews
+            ORDER BY product_id, scraped_at DESC NULLS LAST
+        ) rt ON rt.product_id = j.product_id
+    """
+
+    total = fetch_all(f"SELECT count(*) AS n FROM {JOBS_TABLE} j {where}", tuple(params))[0]["n"]
     rows = fetch_all(
-        f"SELECT * FROM {JOBS_TABLE} {where} ORDER BY {sort_by} {sort_dir} NULLS LAST LIMIT %s OFFSET %s",
+        f"""
+        SELECT j.*, rt.average_rating, rt.total_ratings
+        FROM {JOBS_TABLE} j
+        {ratings_join}
+        {where}
+        ORDER BY j.{sort_by} {sort_dir} NULLS LAST
+        LIMIT %s OFFSET %s
+        """,
         tuple(params) + (page_size, offset),
     )
     total_pages = max((total + page_size - 1) // page_size, 1)
@@ -181,12 +243,22 @@ def list_jobs_page(
 
 def get_stats() -> dict:
     rows = fetch_all(f"SELECT status, count(*) AS n, coalesce(sum(reviews_found), 0) AS reviews FROM {JOBS_TABLE} GROUP BY status")
-    stats = {"pending": 0, "running": 0, "done": 0, "failed": 0, "captcha": 0, "total_reviews_found": 0, "total_jobs": 0}
+    stats = {"pending": 0, "running": 0, "done": 0, "failed": 0, "captcha": 0, "na": 0, "total_reviews_found": 0, "total_jobs": 0}
     for r in rows:
         stats[r["status"]] = r["n"]
         stats["total_reviews_found"] += r["reviews"]
         stats["total_jobs"] += r["n"]
     return stats
+
+
+def ensure_schema() -> None:
+    """headless_mode is a later addition to scraper_control - add it
+    idempotently instead of requiring a separate manual migration step,
+    since this table already existed in production before this column did."""
+    with get_cursor(commit=True) as cursor:
+        cursor.execute(
+            f"ALTER TABLE {CONTROL_TABLE} ADD COLUMN IF NOT EXISTS headless_mode boolean NOT NULL DEFAULT true"
+        )
 
 
 def is_paused() -> bool:
@@ -201,13 +273,27 @@ def set_paused(paused: bool) -> None:
 
 def get_control() -> dict:
     rows = fetch_all(
-        f"""SELECT paused, review_date_from, review_date_to, max_reviews_per_product, max_concurrent_workers
+        f"""SELECT paused, review_date_from, review_date_to, max_reviews_per_product, max_concurrent_workers,
+                   headless_mode
             FROM {CONTROL_TABLE} WHERE id = 1"""
     )
     return rows[0] if rows else {
         "paused": False, "review_date_from": None, "review_date_to": None,
-        "max_reviews_per_product": None, "max_concurrent_workers": 2,
+        "max_reviews_per_product": None, "max_concurrent_workers": 2, "headless_mode": True,
     }
+
+
+def set_headless_mode(headless: bool) -> None:
+    """Live toggle read by the worker pool before every scrape (see
+    worker_pool._scrape_with_retries) - takes effect on the next job that
+    starts, no restart needed. Only changes anything on Windows: on Linux
+    this scraper always runs non-headless against Xvfb regardless (see the
+    use_real_headless note in amazon_reviews._launch_chrome)."""
+    with get_cursor(commit=True) as cursor:
+        cursor.execute(
+            f"UPDATE {CONTROL_TABLE} SET headless_mode = %s, updated_at = now() WHERE id = 1",
+            (headless,),
+        )
 
 
 def set_control(date_from=None, date_to=None, max_reviews=None, max_workers=None) -> dict:

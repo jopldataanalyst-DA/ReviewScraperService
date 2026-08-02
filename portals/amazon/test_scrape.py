@@ -14,7 +14,7 @@ confirming the scrape -> DB write path works end to end.
 import sys
 
 from run_scheduler import insert_new_reviews, insert_rating_snapshot
-from amazon_reviews import scrape_amazon_product, extract_asin
+from scraper import scrape_amazon_product, extract_asin
 
 
 def main():

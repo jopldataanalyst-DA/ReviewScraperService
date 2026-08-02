@@ -19,4 +19,4 @@ cmds = [
 # "disconnected: unable to send message to renderer" on every navigation,
 # with zero trace in kernel logs (dmesg) since it's a pure userspace
 # process-table exhaustion, not an OOM-kill or security-policy denial.
-cmd = "export PATH=/opt/venv/bin:$PATH && exec tini -- uvicorn dashboard:app --host 0.0.0.0 --port ${PORT:-8000}"
+cmd = "export PATH=/opt/venv/bin:$PATH && cd portals/amazon && exec tini -- uvicorn dashboard:app --host 0.0.0.0 --port ${PORT:-8000}"

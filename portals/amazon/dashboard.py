@@ -13,6 +13,7 @@ import signal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 
 import jobs
 import log_buffer
@@ -21,6 +22,12 @@ from worker_pool import start_background_thread
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("dashboard")
 log_buffer.install()
+
+# selenium/urllib3/webdriver_manager are chatty at INFO and drown out the
+# actually useful per-product progress logs in the terminal panel. Raising
+# these to ERROR keeps real failures visible while cutting the noise.
+for _noisy_logger in ("selenium", "urllib3", "webdriver_manager"):
+    logging.getLogger(_noisy_logger).setLevel(logging.ERROR)
 
 
 def _reap_zombie_children(signum, frame) -> None:
@@ -46,19 +53,51 @@ def _reap_zombie_children(signum, frame) -> None:
 if hasattr(signal, "SIGCHLD"):
     signal.signal(signal.SIGCHLD, _reap_zombie_children)
 
+if os.name == "nt":
+    # Windows equivalent of the Linux nofile ulimit fix: the C runtime caps
+    # open file/handle-backed streams at 512 by default (_setmaxstdio),
+    # covering every pipe/socket a Selenium+Chrome worker opens. Confirmed
+    # by direct reproduction: running the local dashboard unattended
+    # overnight accumulated enough open handles across repeated Chrome
+    # launches to hit "[Errno 24] Too many open files" on every subsequent
+    # job, permanently, for the rest of that process's life. 8192 is the
+    # practical ceiling msvcrt.setmaxstdio() accepts.
+    import ctypes
+
+    try:
+        # Some Windows Python builds don't expose msvcrt.setmaxstdio even
+        # though the underlying CRT function exists - call it directly.
+        # legacy msvcrt.dll caps this at 2048 (the newer ucrtbase.dll
+        # supports up to 8192, but 2048 is already a 4x improvement over the
+        # 512 default and is safely supported everywhere).
+        result = ctypes.CDLL("msvcrt")._setmaxstdio(2048)
+        if result == -1:
+            raise OSError("_setmaxstdio returned -1")
+        log.info("Raised Windows max stdio handles to %d", result)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Could not raise Windows stdio handle limit: %s", exc)
+
 app = FastAPI(title="Amazon Review Scraper")
+
+# Images/ is shared at the repo root (portals/amazon/dashboard.py -> repo
+# root is two levels up), not duplicated per portal folder.
+_IMAGES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Images")
+if os.path.isdir(_IMAGES_DIR):
+    app.mount("/static", StaticFiles(directory=_IMAGES_DIR), name="static")
 
 
 @app.on_event("startup")
 def _startup() -> None:
-    from amazon_reviews import prepare_shared_driver
+    from browser import prepare_shared_driver
 
     # Synchronous, single-threaded, before any worker thread exists - see
     # the design note above prepare_shared_driver() in amazon_reviews.py for
     # why this replaced per-attempt driver resolution/patching.
-    log.info("Preparing shared chromedriver (one-time setup)...")
+    jobs.ensure_schema()
+
+    log.info("Preparing chromedriver (one-time setup)...")
     prepare_shared_driver()
-    log.info("Shared chromedriver ready.")
+    log.info("Chromedriver ready.")
 
     start_background_thread()
 
@@ -110,7 +149,7 @@ def api_set_cookies(cookies: list[dict]) -> dict:
 
 @app.post("/api/cookies/test")
 def api_test_cookies() -> dict:
-    from amazon_reviews import check_cookies_valid
+    from scraper import check_cookies_valid
 
     cookies = jobs.get_cookies()
     if not cookies:
@@ -126,6 +165,12 @@ def api_set_settings(
     max_reviews: int | None = None, max_workers: int | None = None,
 ) -> dict:
     return jobs.set_control(date_from=date_from or None, date_to=date_to or None, max_reviews=max_reviews, max_workers=max_workers)
+
+
+@app.post("/api/control/headless")
+def api_set_headless(headless: bool) -> dict:
+    jobs.set_headless_mode(headless)
+    return {"headless_mode": headless}
 
 
 @app.post("/api/control/pause")
@@ -176,9 +221,11 @@ _DASHBOARD_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Amazon Review Scraper</title>
+<link rel="icon" type="image/png" href="/static/icons8-star-96.png">
 <style>
   body { font-family: system-ui, sans-serif; background: #0f1115; color: #e5e7eb; margin: 0; padding: 24px; }
-  h1 { font-size: 20px; margin-bottom: 4px; }
+  h1 { font-size: 20px; margin-bottom: 4px; display: flex; align-items: center; gap: 10px; }
+  h1 img { width: 26px; height: 26px; }
   .sub { color: #9ca3af; font-size: 13px; margin-bottom: 20px; }
   .stats { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
   .card { background: #171a21; border: 1px solid #2a2e37; border-radius: 8px; padding: 12px 16px; min-width: 110px; }
@@ -192,7 +239,16 @@ _DASHBOARD_HTML = """<!doctype html>
   .dot.pending { background: #6b7280; }
   .dot.running { background: #3b82f6; }
   .dot.done { background: #22c55e; }
+  .dot.na { background: #a855f7; }
   .dot.failed { background: #ef4444; }
+  .dot.live { animation: dot-pulse 1.3s ease-in-out infinite; }
+  @keyframes dot-pulse {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(59,130,246,.55); }
+    50% { opacity: .55; box-shadow: 0 0 0 4px rgba(59,130,246,0); }
+  }
+  .card.live-card { border-color: #3b82f6; box-shadow: 0 0 0 1px rgba(59,130,246,.35); }
+  .spinner { width: 12px; height: 12px; border-radius: 50%; border: 2px solid #2a2e37; border-top-color: #3b82f6; display: inline-block; animation: spin .7s linear infinite; margin-right: 8px; vertical-align: -2px; }
+  @keyframes spin { to { transform: rotate(360deg); } }
   .tabs { display: flex; gap: 6px; margin-bottom: 16px; border-bottom: 1px solid #2a2e37; }
   .tab { display: flex; align-items: center; gap: 8px; padding: 9px 14px; cursor: pointer; border: 1px solid transparent; border-bottom: none; border-radius: 8px 8px 0 0; font-size: 13px; color: #9ca3af; }
   .tab:hover { color: #e5e7eb; }
@@ -214,6 +270,7 @@ _DASHBOARD_HTML = """<!doctype html>
   .pending { background: #374151; }
   .running { background: #1d4ed8; }
   .done { background: #15803d; }
+  .na { background: #7e22ce; }
   .failed { background: #b91c1c; }
   #paused-banner { display: none; background: #b45309; padding: 8px 12px; border-radius: 6px; margin-bottom: 16px; font-size: 13px; }
   .panel { background: #171a21; border: 1px solid #2a2e37; border-radius: 8px; padding: 14px 16px; margin-bottom: 20px; }
@@ -245,7 +302,7 @@ _DASHBOARD_HTML = """<!doctype html>
 </style>
 </head>
 <body>
-<h1>Amazon Review Scraper</h1>
+<h1><img src="/static/icons8-star-96.png" alt="logo">Amazon Review Scraper</h1>
 <div class="sub">Live scrape progress and controls</div>
 
 <div id="paused-banner">Scraper is PAUSED — no new jobs will start until resumed.</div>
@@ -257,6 +314,7 @@ _DASHBOARD_HTML = """<!doctype html>
   <button onclick="post('/api/control/resume')">Resume</button>
   <button onclick="post('/api/control/retry-failed')">Retry Failed</button>
   <button onclick="post('/api/control/sync')">Sync Products</button>
+  <button id="headless-toggle" onclick="toggleHeadless()">Show Browser</button>
   <input id="trigger-input" placeholder="product_id to trigger" />
   <button onclick="triggerProduct()">Trigger Product</button>
 </div>
@@ -330,21 +388,37 @@ async function saveSettings() {
   saved.style.display = 'inline';
   setTimeout(() => saved.style.display = 'none', 2000);
 }
+let headlessMode = true;
+function updateHeadlessButton() {
+  document.getElementById('headless-toggle').textContent = headlessMode ? 'Show Browser' : 'Hide Browser';
+}
+async function toggleHeadless() {
+  headlessMode = !headlessMode;
+  updateHeadlessButton();
+  // Takes effect on the next job that starts (worker_pool re-reads this
+  // per job) - already-running scrapes keep whatever mode they launched in.
+  await fetch(`/api/control/headless?headless=${headlessMode}`, { method: 'POST' });
+}
 async function loadSettings() {
   const s = await (await fetch('/api/control/settings')).json();
   if (s.review_date_from) document.getElementById('date-from').value = s.review_date_from;
   if (s.review_date_to) document.getElementById('date-to').value = s.review_date_to;
   if (s.max_reviews_per_product) document.getElementById('max-reviews').value = s.max_reviews_per_product;
   document.getElementById('max-workers').value = s.max_concurrent_workers ?? 2;
+  headlessMode = s.headless_mode ?? true;
+  updateHeadlessButton();
 }
 let searchTerm = '';
 let searchDebounce = null;
 
-const STATUSES = ['pending', 'running', 'done', 'failed'];
+const STATUSES = ['pending', 'running', 'done', 'na', 'failed'];
+const STATUS_LABELS = { na: 'N/A' };
 const COLUMNS = [
   { key: 'product_id', label: 'Product ID' },
   { key: 'company', label: 'Company' },
   { key: 'master_sku', label: 'Master SKU' },
+  { key: null, label: 'Rating' },
+  { key: null, label: 'Total Ratings' },
   { key: 'reviews_found', label: 'Reviews Found' },
   { key: 'attempt_count', label: 'Attempts' },
   { key: 'updated_at', label: 'Updated' },
@@ -399,10 +473,11 @@ function selectTab(status) {
     refreshSection(status);
   }
 }
+let lastRunningCount = 0;
 function renderTabs() {
   const statusTabs = STATUSES.map(s => `
     <div class="tab ${s === activeTab ? 'active' : ''}" onclick="selectTab('${s}')">
-      <span class="dot ${s}"></span>${s.charAt(0).toUpperCase() + s.slice(1)}
+      <span class="dot ${s} ${s === 'running' && lastRunningCount > 0 ? 'live' : ''}"></span>${STATUS_LABELS[s] ?? (s.charAt(0).toUpperCase() + s.slice(1))}
       <span class="count muted" id="tabcount-${s}"></span>
     </div>
   `).join('');
@@ -473,13 +548,16 @@ async function refreshSection(status) {
   document.getElementById(`prev-${status}`).disabled = result.page <= 1;
   document.getElementById(`next-${status}`).disabled = result.page >= result.total_pages;
 
+  const isLive = status === 'running';
   document.getElementById(`body-${status}`).innerHTML = result.rows.map(j => `
     <tr>
-      <td>${j.product_link
+      <td>${isLive ? '<span class="spinner"></span>' : ''}${j.product_link
         ? `<a class="link" href="${j.product_link}" target="_blank" rel="noopener noreferrer">${j.product_id ?? ''}</a>`
         : (j.product_id ?? '')}</td>
       <td>${j.company ?? ''}</td>
       <td>${j.master_sku ?? ''}</td>
+      <td>${j.average_rating != null ? '★ ' + Number(j.average_rating).toFixed(1) : ''}</td>
+      <td>${j.total_ratings ?? ''}</td>
       <td>${j.reviews_found ?? 0}</td>
       <td>${j.attempt_count ?? 0}</td>
       <td>${j.updated_at ? new Date(j.updated_at).toLocaleString() : ''}</td>
@@ -502,8 +580,12 @@ function cookieStatusCard(c) {
 async function refreshAll() {
   const stats = await (await fetch('/api/stats')).json();
   document.getElementById('paused-banner').style.display = stats.paused ? 'block' : 'none';
+  lastRunningCount = stats.running ?? 0;
   document.getElementById('stats').innerHTML = STATUSES.map(k =>
-    `<div class="card"><div class="n">${stats[k] ?? 0}</div><div class="l">${k}</div></div>`
+    `<div class="card ${k === 'running' && lastRunningCount > 0 ? 'live-card' : ''}">
+      <div class="n">${k === 'running' && lastRunningCount > 0 ? '<span class="spinner"></span>' : ''}${stats[k] ?? 0}</div>
+      <div class="l">${STATUS_LABELS[k] ?? k}</div>
+    </div>`
   ).join('')
     + `<div class="card"><div class="n">${stats.total_reviews_found ?? 0}</div><div class="l">total reviews found</div></div>`
     + cookieStatusCard(stats.cookies);
@@ -512,6 +594,8 @@ async function refreshAll() {
     const el = document.getElementById(`tabcount-${s}`);
     if (el) el.textContent = `(${(stats[s] ?? 0).toLocaleString()})`;
   });
+  const runningDot = document.querySelector('.tab .dot.running');
+  if (runningDot) runningDot.classList.toggle('live', lastRunningCount > 0);
 
   // Only the visible tab's table needs live row data - the others just show
   // their count until clicked, so we're not running 5x the queries every cycle.
@@ -640,7 +724,7 @@ renderTabs();
 document.getElementById(`section-${activeTab}`).style.display = 'block';
 loadSettings();
 refreshAll();
-setInterval(refreshAll, 5000);
+setInterval(refreshAll, 1500);
 </script>
 </body>
 </html>
