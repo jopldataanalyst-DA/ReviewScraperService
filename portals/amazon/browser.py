@@ -160,9 +160,36 @@ def make_driver(headless: bool = True, user_data_dir: str | None = None):
     # navigation under --headless=new - run non-headless against a virtual
     # Xvfb display there instead, same as before.
     use_real_headless = os.name == "nt"
-    if headless and use_real_headless:
-        opts.add_argument("--headless=new")
-    elif not use_real_headless:
+    if use_real_headless:
+        if headless:
+            opts.add_argument("--headless=new")
+    else:
+        # Container-stability flags - confirmed by direct reproduction
+        # (both in this codebase's git history and again today, when this
+        # rewrite briefly dropped them): the deployed VPS's nix-provided
+        # Chromium has no real GPU/drivers, and letting Chrome attempt GPU
+        # compositing for actual page rendering (not just process startup,
+        # which succeeds fine even without these) crashes the renderer on
+        # the very first navigation - "disconnected: unable to send message
+        # to renderer" / "cannot determine loading status" on every single
+        # driver.get() or execute_script() call, 100% of the time. These
+        # trade off unnecessary subsystems Chrome doesn't need for a
+        # scraping workload for stability in a constrained container. Always
+        # applied on non-Windows regardless of the headless setting, since
+        # --headless=new is never used there (it's the thing that crashes) -
+        # Xvfb + these flags is the only stable combination on this host.
+        opts.add_argument("--disable-gpu")
+        opts.add_argument("--disable-software-rasterizer")
+        opts.add_argument("--disable-background-networking")
+        opts.add_argument("--disable-default-apps")
+        opts.add_argument("--disable-extensions")
+        opts.add_argument("--disable-sync")
+        opts.add_argument("--disable-translate")
+        opts.add_argument("--metrics-recording-only")
+        opts.add_argument("--mute-audio")
+        opts.add_argument("--no-first-run")
+        opts.add_argument("--safebrowsing-disable-auto-update")
+        opts.add_argument("--disable-setuid-sandbox")
         start_xvfb()
 
     service = Service(_resolve_driver_path())
