@@ -76,8 +76,12 @@ def start_xvfb() -> None:
             return
         xvfb_path = shutil.which("Xvfb")
         if not xvfb_path:
-            log.error("Xvfb not found on PATH - Chrome will have no display to render into on this host.")
-            return
+            # Raise (not just log) - a log line was proving too easy to miss
+            # in the deploy log viewer in practice. Raising puts the actual
+            # cause directly into the "Scrape attempt raised" traceback that
+            # already gets surfaced/copied every time, instead of requiring
+            # a scroll back to container startup to find a log line.
+            raise RuntimeError("Xvfb not found on PATH - Chrome has no display to render into on this host.")
         _xvfb_proc = subprocess.Popen(
             [xvfb_path, ":99", "-screen", "0", "1440x900x24", "-nolisten", "tcp"],
             stdout=subprocess.PIPE,
@@ -87,11 +91,10 @@ def start_xvfb() -> None:
         return_code = _xvfb_proc.poll()
         if return_code is not None:
             output = _xvfb_proc.stdout.read().decode(errors="replace") if _xvfb_proc.stdout else ""
-            log.error(
-                "Xvfb exited immediately (code %s) - Chrome will have no real display. Output: %s",
-                return_code, output.strip() or "(no output)",
+            raise RuntimeError(
+                f"Xvfb exited immediately (code {return_code}) - Chrome has no real display. "
+                f"Output: {output.strip() or '(no output)'}"
             )
-            return
         os.environ["DISPLAY"] = ":99"
         log.info("Xvfb virtual display started on :99 (pid %s)", _xvfb_proc.pid)
 
