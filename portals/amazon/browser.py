@@ -270,7 +270,14 @@ def load_cookies(driver, cookies=None, cookies_path: str | None = None) -> bool:
             driver.add_cookie(cookie)
             loaded += 1
         except Exception as exc:  # noqa: BLE001 - one bad cookie shouldn't block the rest
-            log.debug("Skipped cookie %s: %s", c.get("name"), exc)
+            # Was log.debug (invisible at the INFO level this app runs at) -
+            # bumped to warning because "0/14 cookies loaded" with the actual
+            # per-cookie reason hidden was a dead end while debugging why
+            # every scrape hit Amazon's bot-check page: a driver with no
+            # session cookies at all looks like a first-time anonymous
+            # visitor on every single request, which is close to a worst-
+            # case bot-detection signal.
+            log.warning("Skipped cookie %s (domain=%s): %s", c.get("name"), c.get("domain"), exc)
 
     log.info("Loaded %s/%s cookies.", loaded, len(cookies))
     return loaded > 0
