@@ -27,78 +27,6 @@ log = logging.getLogger("browser")
 # (which doesn't run out of the temp dir).
 _TEMP_DIR = tempfile.gettempdir()
 
-_xvfb_proc = None
-_xvfb_lock = None
-
-
-def start_xvfb() -> None:
-    """Start a virtual framebuffer once per process and point DISPLAY at it.
-
-    Real headless mode (--headless=new) crashes on first navigation with
-    the deployed VPS's nix-provided Chromium (confirmed by direct
-    reproduction: "disconnected: unable to send message to renderer" on
-    every single driver.get(), 100% of the time). Running Chrome
-    non-headless against an Xvfb virtual display avoids that code path
-    entirely while still requiring no real display/GPU. Idempotent and
-    thread-safe - every worker thread calls this before launching a driver
-    on a non-Windows host.
-
-    Verifies the Xvfb process actually stayed alive before setting DISPLAY -
-    previously this set DISPLAY unconditionally right after Popen() and sent
-    Xvfb's own stdout/stderr to DEVNULL, so if Xvfb itself failed to start
-    (missing dependency, permission issue, etc.) Chrome would still get
-    pointed at a DISPLAY that doesn't actually exist, producing the exact
-    same "disconnected: unable to send message to renderer" symptom as the
-    GPU/headless issue this function exists to work around - but with the
-    real cause (Xvfb never came up) completely invisible in the logs.
-    Captures Xvfb's own output now specifically so that failure is visible
-    instead of silently masquerading as a Chrome/renderer bug.
-
-    Deliberately does NOT trust a pre-existing DISPLAY env var as a signal
-    that a display is already available - confirmed by direct reproduction
-    on the deployed container: DISPLAY was already set to something (base
-    image default, unrelated to this function) before this ever ran, so the
-    old "if os.environ.get('DISPLAY'): return" guard skipped launching Xvfb
-    entirely, on every single call, with zero log output either way -
-    Chrome then pointed at a DISPLAY with no real X server behind it.
-    Idempotency is tracked via _xvfb_proc (our own process handle) instead."""
-    global _xvfb_proc, _xvfb_lock
-    import shutil
-    import subprocess
-    import threading
-
-    if _xvfb_proc is not None and _xvfb_proc.poll() is None:
-        return  # our own Xvfb is already up
-    if _xvfb_lock is None:
-        _xvfb_lock = threading.Lock()
-    with _xvfb_lock:
-        if _xvfb_proc is not None and _xvfb_proc.poll() is None:
-            return
-        xvfb_path = shutil.which("Xvfb")
-        if not xvfb_path:
-            # Raise (not just log) - a log line was proving too easy to miss
-            # in the deploy log viewer in practice. Raising puts the actual
-            # cause directly into the "Scrape attempt raised" traceback that
-            # already gets surfaced/copied every time, instead of requiring
-            # a scroll back to container startup to find a log line.
-            raise RuntimeError("Xvfb not found on PATH - Chrome has no display to render into on this host.")
-        _xvfb_proc = subprocess.Popen(
-            [xvfb_path, ":99", "-screen", "0", "1440x900x24", "-nolisten", "tcp"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        time.sleep(1)
-        return_code = _xvfb_proc.poll()
-        if return_code is not None:
-            output = _xvfb_proc.stdout.read().decode(errors="replace") if _xvfb_proc.stdout else ""
-            raise RuntimeError(
-                f"Xvfb exited immediately (code {return_code}) - Chrome has no real display. "
-                f"Output: {output.strip() or '(no output)'}"
-            )
-        os.environ["DISPLAY"] = ":99"
-        log.info("Xvfb virtual display started on :99 (pid %s)", _xvfb_proc.pid)
-
-
 def _detect_chrome_binary() -> str | None:
     """Find whatever Chrome/Chromium binary is actually installed. On the
     VPS (Nixpacks) this is nix's "chromium" package - there's no fixed path
@@ -186,60 +114,39 @@ def make_driver(headless: bool = True, user_data_dir: str | None = None):
     if user_data_dir:
         opts.add_argument(f"--user-data-dir={user_data_dir}")
 
-    # Real headless mode works fine on a Windows dev machine's real Chrome
-    # install. On the deployed VPS, nix's Chromium crashes on first
-    # navigation under --headless=new - run non-headless against a virtual
-    # Xvfb display there instead, same as before.
-    use_real_headless = os.name == "nt"
-    if use_real_headless:
-        if headless:
-            opts.add_argument("--headless=new")
-    else:
-        # Container-stability flags - confirmed by direct reproduction
-        # (both in this codebase's git history and again today, when this
-        # rewrite briefly dropped them): the deployed VPS's nix-provided
-        # Chromium has no real GPU/drivers, and letting Chrome attempt GPU
-        # compositing for actual page rendering (not just process startup,
-        # which succeeds fine even without these) crashes the renderer on
-        # the very first navigation - "disconnected: unable to send message
-        # to renderer" / "cannot determine loading status" on every single
-        # driver.get() or execute_script() call, 100% of the time. These
-        # trade off unnecessary subsystems Chrome doesn't need for a
-        # scraping workload for stability in a constrained container. Always
-        # applied on non-Windows regardless of the headless setting, since
-        # --headless=new is never used there (it's the thing that crashes) -
-        # Xvfb + these flags is the only stable combination on this host.
-        opts.add_argument("--disable-gpu")
-        opts.add_argument("--disable-software-rasterizer")
-        opts.add_argument("--disable-background-networking")
-        opts.add_argument("--disable-default-apps")
-        opts.add_argument("--disable-extensions")
-        opts.add_argument("--disable-sync")
-        opts.add_argument("--disable-translate")
-        opts.add_argument("--metrics-recording-only")
-        opts.add_argument("--mute-audio")
-        opts.add_argument("--no-first-run")
-        opts.add_argument("--safebrowsing-disable-auto-update")
-        opts.add_argument("--disable-setuid-sandbox")
-        # Memory/process-count reduction. With Xvfb confirmed running and
-        # the GPU flags above already applied, Chrome's browser process
-        # starts fine and the session is created - it's specifically the
-        # RENDERER process that dies on the first command ("disconnected:
-        # unable to send message to renderer"), which points at the
-        # renderer being killed rather than at graphics or display setup.
-        # A memory-constrained container is the most likely cause, so cut
-        # the number of processes Chrome spawns and the memory each needs:
-        # one renderer total, no out-of-process iframes, no crash-reporting
-        # subsystem.
-        opts.add_argument("--renderer-process-limit=1")
-        opts.add_argument("--disable-features=site-per-process,VizDisplayCompositor")
-        opts.add_argument("--disable-breakpad")
-        opts.add_argument("--disable-crash-reporter")
-        opts.add_argument("--disable-hang-monitor")
-        opts.add_argument("--disable-ipc-flooding-protection")
-        opts.add_argument("--disable-backgrounding-occluded-windows")
-        opts.add_argument("--disable-renderer-backgrounding")
-        start_xvfb()
+    # Real headless mode (--headless=new) works fine on both a Windows dev
+    # machine's real Chrome install AND the deployed nix-based container -
+    # confirmed by direct reproduction on the live deploy: running chromium
+    # directly with --headless=new --dump-dom exited 0 with real page
+    # content, while going through Selenium with the non-headless-plus-
+    # Xvfb approach this codebase used historically still failed with
+    # "disconnected: unable to send message to renderer" on every attempt.
+    # That old approach was based on years-old Chrome versions where
+    # --headless=new genuinely did crash in this exact container - Chrome
+    # 130 (currently deployed) clearly doesn't have that problem anymore,
+    # and the simpler, directly-verified-working real-headless path
+    # replaces the whole Xvfb workaround rather than debugging why it
+    # wasn't working.
+    if headless:
+        opts.add_argument("--headless=new")
+
+    # Container-stability flags - harmless on a real desktop, and were
+    # already load-bearing for this exact container in the past (see git
+    # history) even if the specific renderer-disconnect bug they were added
+    # for turned out this time to be the Xvfb path rather than these flags.
+    # Kept as a defensive baseline for any GPU-less/constrained host.
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-software-rasterizer")
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-default-apps")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--disable-sync")
+    opts.add_argument("--disable-translate")
+    opts.add_argument("--metrics-recording-only")
+    opts.add_argument("--mute-audio")
+    opts.add_argument("--no-first-run")
+    opts.add_argument("--safebrowsing-disable-auto-update")
+    opts.add_argument("--disable-setuid-sandbox")
 
     service = Service(_resolve_driver_path())
     driver = webdriver.Chrome(service=service, options=opts)
