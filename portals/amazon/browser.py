@@ -221,6 +221,24 @@ def make_driver(headless: bool = True, user_data_dir: str | None = None):
         opts.add_argument("--no-first-run")
         opts.add_argument("--safebrowsing-disable-auto-update")
         opts.add_argument("--disable-setuid-sandbox")
+        # Memory/process-count reduction. With Xvfb confirmed running and
+        # the GPU flags above already applied, Chrome's browser process
+        # starts fine and the session is created - it's specifically the
+        # RENDERER process that dies on the first command ("disconnected:
+        # unable to send message to renderer"), which points at the
+        # renderer being killed rather than at graphics or display setup.
+        # A memory-constrained container is the most likely cause, so cut
+        # the number of processes Chrome spawns and the memory each needs:
+        # one renderer total, no out-of-process iframes, no crash-reporting
+        # subsystem.
+        opts.add_argument("--renderer-process-limit=1")
+        opts.add_argument("--disable-features=site-per-process,VizDisplayCompositor")
+        opts.add_argument("--disable-breakpad")
+        opts.add_argument("--disable-crash-reporter")
+        opts.add_argument("--disable-hang-monitor")
+        opts.add_argument("--disable-ipc-flooding-protection")
+        opts.add_argument("--disable-backgrounding-occluded-windows")
+        opts.add_argument("--disable-renderer-backgrounding")
         start_xvfb()
 
     service = Service(_resolve_driver_path())
