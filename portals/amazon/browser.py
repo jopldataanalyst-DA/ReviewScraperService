@@ -41,7 +41,18 @@ def start_xvfb() -> None:
     non-headless against an Xvfb virtual display avoids that code path
     entirely while still requiring no real display/GPU. Idempotent and
     thread-safe - every worker thread calls this before launching a driver
-    on a non-Windows host."""
+    on a non-Windows host.
+
+    Verifies the Xvfb process actually stayed alive before setting DISPLAY -
+    previously this set DISPLAY unconditionally right after Popen() and sent
+    Xvfb's own stdout/stderr to DEVNULL, so if Xvfb itself failed to start
+    (missing dependency, permission issue, etc.) Chrome would still get
+    pointed at a DISPLAY that doesn't actually exist, producing the exact
+    same "disconnected: unable to send message to renderer" symptom as the
+    GPU/headless issue this function exists to work around - but with the
+    real cause (Xvfb never came up) completely invisible in the logs.
+    Captures Xvfb's own output now specifically so that failure is visible
+    instead of silently masquerading as a Chrome/renderer bug."""
     global _xvfb_proc, _xvfb_lock
     import shutil
     import subprocess
@@ -56,16 +67,24 @@ def start_xvfb() -> None:
             return
         xvfb_path = shutil.which("Xvfb")
         if not xvfb_path:
-            log.warning("Xvfb not found on PATH - falling back to no virtual display")
+            log.error("Xvfb not found on PATH - Chrome will have no display to render into on this host.")
             return
         _xvfb_proc = subprocess.Popen(
             [xvfb_path, ":99", "-screen", "0", "1440x900x24", "-nolisten", "tcp"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
-        os.environ["DISPLAY"] = ":99"
         time.sleep(1)
-        log.info("Xvfb virtual display started on :99")
+        return_code = _xvfb_proc.poll()
+        if return_code is not None:
+            output = _xvfb_proc.stdout.read().decode(errors="replace") if _xvfb_proc.stdout else ""
+            log.error(
+                "Xvfb exited immediately (code %s) - Chrome will have no real display. Output: %s",
+                return_code, output.strip() or "(no output)",
+            )
+            return
+        os.environ["DISPLAY"] = ":99"
+        log.info("Xvfb virtual display started on :99 (pid %s)", _xvfb_proc.pid)
 
 
 def _detect_chrome_binary() -> str | None:
