@@ -90,9 +90,20 @@ _driver_path_lock = None
 
 def _resolve_driver_path() -> str:
     """Resolve (and cache) the chromedriver executable path once per
-    process. webdriver_manager's ChromeDriverManager().install() is already
-    safe to call repeatedly - it just returns the cached path once
-    downloaded - but there's no reason to re-touch it on every scrape."""
+    process.
+
+    Prefers whatever "chromedriver" is already on PATH - on the deployed VPS
+    that's nix's own chromedriver package (see nixpacks.toml's
+    nixPkgs = [..., "chromedriver"]), built against the container's actual
+    nix-store libraries. Confirmed by direct reproduction: falling straight
+    to webdriver_manager's ChromeDriverManager().install() instead (which
+    downloads a generic prebuilt linux64 binary) fails there with
+    `Status code was: 127` ("cannot execute") on every single launch - that
+    generic build's dynamic linker expects standard FHS library paths
+    (/lib, /usr/lib) that don't exist on this nix-based container. Only
+    falls back to downloading one when chromedriver isn't already on PATH
+    (e.g. this Windows dev machine, which has no nix package for it)."""
+    import shutil
     import threading
 
     global _driver_executable_path, _driver_path_lock
@@ -102,9 +113,13 @@ def _resolve_driver_path() -> str:
             _driver_path_lock = threading.Lock()
         with _driver_path_lock:
             if _driver_executable_path is None:
-                from webdriver_manager.chrome import ChromeDriverManager
+                path_chromedriver = shutil.which("chromedriver")
+                if path_chromedriver:
+                    _driver_executable_path = path_chromedriver
+                else:
+                    from webdriver_manager.chrome import ChromeDriverManager
 
-                _driver_executable_path = ChromeDriverManager().install()
+                    _driver_executable_path = ChromeDriverManager().install()
     return _driver_executable_path
 
 
